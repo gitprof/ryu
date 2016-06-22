@@ -104,7 +104,8 @@ from ryu.lib.packet import ether_types
 from ryu.topology.api import get_switch, get_link
 from ryu.app.wsgi import ControllerBase
 from ryu.topology import event, switches
-
+from ryu.app.rest_router import ipv4_text_to_int
+from ryu.lib.ip import ipv4_to_bin
 
 class StaticRouting(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_0.OFP_VERSION]
@@ -118,11 +119,9 @@ class StaticRouting(app_manager.RyuApp):
         #    edges attributes: 'port_%d_to_%d'=port_num (dpids, for both directions). 'mac_%d_to_%d'=mac_of_src_dev
         #    nodes attributes: 'logical'=True/False, 'datapath'=datapath.
         self.network=nx.Graph()
-        self.pair_to_paths = {} # attr:  'LOGICAL' and 'ROUTING'
-        self.logical_graph = nx.Graph() # edges attributes:  'MIN_CAP'.  'WEIGHT' = minimal_capacity_of_physical_link / num_of_logical_paths_via_e
-        self.link_to_paths = {}  # attr:  'LOGICAL' and 'ROUTING'
         self.forwarding_by_ids = {}
-
+        self.network_is_running = False
+        self.links_down = 0
         self.init_topo()
         # mapping:      sw_id -> (pair_sw_id -> next_hop_id).       all IDs are of the OptNet object
         # mapping:      hostid: 'mac'=mac. 'ipv4'=ip
@@ -131,89 +130,46 @@ class StaticRouting(app_manager.RyuApp):
         self.switch_dpid_to_host_mac = {}
         self.num_of_hosts = 0
 
+    def check_and_update_network(self, switch_down = None, link_down = None):
+        if   None != switch_down:
+            self.logger.info("check_and_update_network: removing switch not supported yet")
+            TODO = 0
+        elif None != link_down:
+            #assert (self.network_is_running) and (self.links_down == 0) , "link got down before network establishment!"
+            self.logger.info("check_and_update_network: link (%s,%s) removed" % (link_down))
+            self.recover_from_link_failure(link_down)
+            self.network_is_running = True
+            self.links_down += 1
+            TODO = 0
+        else:
+            if self.network_is_ready():
+                self.set_flow_tables()
+                self.network_is_running = True
+
+
     def recover_from_link_failure(self, link):
         self.logger.info("recover_from_link_failure:")
-        routing_paths_to_recover = self.link_to_paths[link]['ROUTING']
-        logical_paths_to_remove  = self.link_to_paths[link]['LOGICAL']
-
-        for path in logical_paths_to_remove:
-            r1 = path[0]
-            r2 = path[1]
-            self.logical_graph.remove_edge(r1,r2)
-            self.link_to_path[link]['LOGICAL'] = []
-
-    def get_links_from_path(self, path):
-        links = []
-        for ix in path[:-1]:
-            n1 = min(path[ix], path[ix+1])
-            n2 = max(path[ix], path[ix+1])
-            links.append((n1, n2))
-        return links
-
+        old_routing_paths  = self.optNet.get_routing_paths()
+        new_routing_paths = self.optNet.reset_after_link_failure(link)
+        self.init_forwarding_by_ids(new_routing_paths)
+        modified_routing_paths = self.optNet.get_modified_routing_paths(old_routing_paths, new_routing_paths)
+        pairs_to_set = [(path[0], path[-1]) for path in modified_routing_paths]
+        self.set_flow_tables(pairs_to_set)
 
     def set_routing_paths(self):
-        #prepare logical graph weights
-        local_logical_graph = copy.deepcopy(self.logical_graph)
-        for edge in local_logical_graph.edges():
-            min_cap = local_logical_graph[edge[0]][edge[1]]['MIN_CAP']
-            logical_paths_via_e = len(self.link_to_paths[edge]['LOGICAL'])
-            local_logical_graph[edge[0]][edge[1]]['WEIGHT'] = int((INC_FACTOR / (float(min_cap) / logical_paths_via_e)))
+        self.optNet.set_routing_paths()
 
-        # run shortest paths and set results to pair_to_paths
-        routing_paths = nx.all_paris_dijkstra_path(local_logical_graph, weight = 'WEIGHT')
-        for logical_node1 in sorted(self.optNet.get_logical_nodes()):
-            for logical_node2 in sorted(self.optNet.get_logical_nodes()):
-                if logical_node1 >= logical_node2:
-                    continue
-                path = routing_paths[logical_node1][logical_node2]
-                self.pair_to_paths[(logical_node1, logical_node2)]['ROUTING'] = path
-                links = self.get_links_from_paths(path)
-                for link in links:
-                    self.link_to_paths[link]['ROUTING'].append(path)
 
-    MAX_EDGE_CAPACITY=10
-
-    '''
-        Setting link_to_logical_paths and logical_graph by optNet
-    '''
-    def set_static_data_structs(self):
-        for link in self.optNet.physical_links():
-            self.link_to_paths[link] = {'ROUTING': [], 'LOGICAL': []}
-        for link in self.optNet.physical_links():
-            self.link_to_paths[link] = {'ROUTING': [], 'LOGICAL': []}
-        logical_paths = self.optNet.get_logical_network().get_paths()
-        for logical_path in logical_paths:
-            minimal_capacity = MAX_EDGE_CAPACITY
-            for ix in logical_path[:-1]:
-                n1 = max(logical_path[ix], logical_path[ix+1])
-                n2 = min(logical_path[ix], logical_path[ix+1])
-                minimal_capacity = min(minimal_capacity, self.optNet.get_plink_capacity(n1,n2))
-                self.link_to_paths[(n1,n2)]['LOGICAL'].append(logical_path)
-            logical_pair = (logical_path[0], logical_path[-1])
-            if not logical_pair in self.logical_graph.edges():
-                self.logical_graph.add_edge(logical_pair)
-            self.logical_graph[logical_pair[0]][logical_pair[1]]['MIN_CAP'] = minimal_capacity
-
-    def get_logical_pairs(self):
-        pairs = []
-        for r1 in sorted(self.optNet.get_logical_nodes()):
-            for r2 in sorted(self.optNet.get_logical_nodes()):
-                if r1 >= r2:
-                    continue
-                pairs.append((r1,r2))
-        return pairs
-
-    def init_forwarding_by_ids(self):
-
+    def init_forwarding_by_ids(self, routing_paths):
+        self.logger.info("init_forwarding_by_ids: routing_paths=%s" % (routing_paths))
         for sw_id in self.optNet.nodes():
             # mapping:
             self.forwarding_by_ids[sw_id] = {}
 
         closed = []
-        for pair in self.pair_to_paths.keys():
-            self.logger.info('***set flow for pair: %s' % pair)
-            sw_id_1, sw_id_2 = pair
-            path = self.pair_to_paths[pair]
+        for path in routing_paths:
+            self.logger.info('***set flow for path %s' % path)
+            sw_id_1, sw_id_2 = path[0], path[-1]
             for ix in range(len(path)):
                 sw_id = path[ix]
                 next_hop_id = sw_id if sw_id == path[-1] else path[ix+1] #TODO: find hosts ports
@@ -225,42 +181,49 @@ class StaticRouting(app_manager.RyuApp):
         #self.logger.info(self.forwarding_by_ids[1].keys() )
         #self.logger.info(forwarding_by_ids[1].keys() )
 
-    def set_all_flow_tables(self):
-        self.logger.info('set_all_flow_tables:')
+    '''
+        4 Parameters determine the next hop in an absolute way:
+            - src mac
+            - dst mac
+            - port in
+            - port out
+    '''
+    def set_flow_tables(self, pairs = None):
+        self.logger.info('set_flow_tables:')
         logical_nodes = self.optNet.get_logical_nodes()
         sw_ids = self.optNet.nodes()
 
-        self.logger.info('set_all_flow_tables: WHAT?')
-        self.logger.info('set_all_flow_tables: forwarding_by_ids = %s' % (self.forwarding_by_ids))
+        self.logger.info('set_flow_tables: forwarding_by_ids = %s' % (self.forwarding_by_ids))
 
-        for sw_id in sw_ids:
-            for l_sw_id1 in logical_nodes:
-                for l_sw_id2 in logical_nodes:
-                    self.logger.info('set_all_flow_tables: setting flow for %d from %d to %d ' % (sw_id, l_sw_id1, l_sw_id2 ))
-                    try:
-                        next_hop_id = self.forwarding_by_ids[sw_id][(l_sw_id1, l_sw_id2)]
-                        #prev_hop_id = self.forwarding_by_ids[sw_id][(l_sw_id1, l_sw_id2)]
-                    except KeyError:
-                        self.logger.info('set_all_flow_tables: doenst exist')
+        pairs_to_set = self.optNet.get_logical_pairs() if None == pairs else pairs
+        for l_sw_id1, l_sw_id2 in pairs_to_set:
+            for sw_id in sw_ids:
+                self.logger.info('set_flow_tables: setting flow for %d from %d to %d ' % (sw_id, l_sw_id1, l_sw_id2 ))
+                try:
+                    next_hop_id = self.forwarding_by_ids[sw_id][(l_sw_id1, l_sw_id2)]
+                    prev_hop_id = self.forwarding_by_ids[sw_id][(l_sw_id2, l_sw_id1)]
+                    #prev_hop_id = self.forwarding_by_ids[sw_id][(l_sw_id1, l_sw_id2)]
+                except KeyError:
+                    self.logger.info('set_flow_tables: doenst exist')
 
-                        continue
-                    sw_dpid      = self.id_to_dpid(sw_id)
-                    next_hop_dpid = self.id_to_dpid(next_hop_id)
-                    if next_hop_id != sw_id:
-                        port_out = self.network[sw_dpid][next_hop_dpid]["port_%d_to_%d" % (sw_dpid, next_hop_dpid)]
-                    else:
-                        port_out = 1 #TODO: find hosts port num
+                    continue
+                sw_dpid      = self.id_to_dpid(sw_id)
+                next_hop_dpid = self.id_to_dpid(next_hop_id)
+                prev_hop_dpid = self.id_to_dpid(prev_hop_id)
+                port1 = 1 if (next_hop_id == sw_id) else self.network[sw_dpid][next_hop_dpid]["port_%d_to_%d" % (sw_dpid, next_hop_dpid)]
+                port2 = 1 if (prev_hop_id == sw_id) else self.network[sw_dpid][prev_hop_dpid]["port_%d_to_%d" % (sw_dpid, prev_hop_dpid)]
 
-                    self.logger.info('sw_id=%s. next_hop_id=%s. port_out=%s' % (sw_id, next_hop_id, port_out))
-                    datapath = self.network[sw_dpid]['datapath']
-                    in_port  = None
-                    mac_src  = self.switch_dpid_to_host_mac[l_sw_id1]
-                    mac_dst  = self.switch_dpid_to_host_mac[l_sw_id2]
-                    ip_src   = self.host_mac_to_ipv4(mac_src)
-                    ip_dst   = self.host_mac_to_ipv4(mac_dst)
+                self.logger.info('sw_id=%s. prev_hop_id=%s. port_in=%s. next_hop_id=%s. port_out=%s' % (sw_id, prev_hop_id, port1, next_hop_id, port2))
+                datapath = self.network[sw_dpid]['datapath']
+                mac1  = self.switch_dpid_to_host_mac[l_sw_id1]
+                mac2  = self.switch_dpid_to_host_mac[l_sw_id2]
+                ip1   = self.host_mac_to_ipv4(mac1)
+                ip2   = self.host_mac_to_ipv4(mac2)
+                for direction in [0,1]:
+                    (mac_src, mac_dst, port_in, port_out, ip_src, ip_dst) = (mac1, mac2, port2, port1, ip1, ip2) if direction == 0 else (mac2, mac1, port1, port2, ip2, ip1)
                     actions  = [datapath.ofproto_parser.OFPActionOutput(port_out)]
                     self.add_flow(dpid    = sw_dpid,
-                                  in_port = in_port,
+                                  in_port = port_in,
                                   mac_dst = mac_dst,
                                   mac_src = mac_src,
                                   ip_dst  = ip_dst,
@@ -306,7 +269,7 @@ class StaticRouting(app_manager.RyuApp):
         with open(PICKLED_LOGICAL_PATHS, 'rb') as f:
             logical_paths = pk.load(f)
 
-        self.optNet = OptNet.OpticalNetwork()
+        self.optNet = OptNet.OpticalNetwork(master = True)
         self.optNet.init_graph_from_file(graph_file)
         self.optNet.l_net.init_from_paths(logical_paths)
         self.logger.info("get_running_opt_net: graph_file=%s. logical_paths=%s" % (graph_file, logical_paths))
@@ -317,9 +280,9 @@ class StaticRouting(app_manager.RyuApp):
 
         self.logger.info('init_topo: physical: %s' % self.optNet.physical_links())
 
-        self.set_static_data_structs()
         # we assume dpid = node number in the OpticalNetwork
-        self.init_forwarding_by_ids()
+        self.set_routing_paths()
+        self.init_forwarding_by_ids(self.optNet.get_routing_paths())
 
 
 
@@ -334,11 +297,12 @@ class StaticRouting(app_manager.RyuApp):
         self.logger.info("add_flow: datapath=%s. in_port=%s" % (datapath, in_port))
 
         match = datapath.ofproto_parser.OFPMatch(
-            in_port=in_port, dl_dst=haddr_to_bin(mac_dst))
-
-        match = datapath.ofproto_parser.OFPMatch(
-            in_port=in_port, dl_dst=haddr_to_bin(mac_dst),
-                             dl_src=haddr_to_bin(mac_src))
+                            in_port=in_port,
+                            #dl_dst=haddr_to_bin(mac_dst),
+                            #dl_src=haddr_to_bin(mac_src),
+                            nw_src=struct.unpack('!I', ipv4_to_bin(ip_src))[0],
+                            nw_dst=struct.unpack('!I', ipv4_to_bin(ip_dst))[0],
+                            dl_type=0x800)
 
 
         mod = datapath.ofproto_parser.OFPFlowMod(
@@ -425,22 +389,13 @@ class StaticRouting(app_manager.RyuApp):
                 network_edges.append(edge)
         return network_edges
 
-    def check_and_update_network(self, switch_down = None, link_down = None):
-        if   None != switch_down:
-            self.logger.info("check_and_update_network: removing switch not supported yet")
-            TODO = 0
-        elif None != link_down:
-            self.logger.info("check_and_update_network: removing link not supported yet")
-            TODO = 0
-        else:
-            if self.network_is_ready():
-                self.set_all_flow_tables()
 
     def host_mac_to_ipv4(self, mac):
-        return "10.0.0.%d" % (int(mac[-2:-1])) # TODO: fix this shit
+        self.logger.info("************* MAC = %s" % (mac) )
+        return "10.0.0.%d" % (int(mac[-2:])) # TODO: fix this shit
 
     def host_mac_to_id(self, mac):
-        return int(mac[-2:-1]) # TODO: fix
+        return int(mac[-2:]) # TODO: fix
 
     def host_id_to_mac(self, _id):
         return hex(_id)[2:] #TODO
@@ -553,8 +508,7 @@ class StaticRouting(app_manager.RyuApp):
         self.network[dpid]['datapath'] = ev.switch.dp
         self.network[dpid]['logical'] = self.optNet.is_logical_node(self.dpid_to_id(dpid))
 
-        if self.network_is_ready():
-            self.set_all_flow_tables()
+        self.check_and_update_network(switch_down = None, link_down = None)
 
 
 
@@ -588,6 +542,9 @@ class StaticRouting(app_manager.RyuApp):
     def handle_switch_down(self, ev):
 
         self.logger.info("handle_switch_down: ev=%s. ev.switch=%s. ev.switch.dp=%s. ev.switch.dp.address=%s" % (ev, ev.switch, ev.switch.dp, ev.switch.dp.address))
+        if self.optNet != None:
+            self.optNet.destroy()
+        self.optNet = None
         #self.logger.info("ev attrs:")
         #self.print_attrs(ev) # switch
         #self.logger.info("ev.switch attrs:")
