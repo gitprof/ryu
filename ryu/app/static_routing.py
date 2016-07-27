@@ -284,6 +284,7 @@ class StaticRouting(app_manager.RyuApp):
     def init_topo(self):
         self.get_running_opt_net()
         self.logNet = self.optNet.get_logical_network()
+        self.logNet.print_paths()
         # we save original logical network for repro after link is up
         self.logNetInitial = copy.deepcopy(self.logNet)
         self.logger.info('init_topo: physical: %s' % self.optNet.physical_links())
